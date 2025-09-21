@@ -1,8 +1,9 @@
 from typing import Any, Optional, TypeVar, Union
 import numpy as np
+import torch
 import torch as th
 import torch.nn.functional as F
-
+import torch.nn as nn
 from stable_baselines.common.buffers import ReplayBuffer
 from stable_baselines.common.noise import ActionNoise
 from stable_baselines.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -12,6 +13,20 @@ from stable_baselines.common.utils import polyak_update
 
 SelfDDPG = TypeVar("SelfDDPG", bound="DDPG_PINN")
 
+class SimpleLNN(nn.Module):
+    def __init__(self, state_dim, hidden_dim=64):
+        super().__init__()
+        self.V_net = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))  # Potential energy
+        self.L_net = nn.Linear(state_dim, state_dim * state_dim)  # For mass matrix (lower triangular)
+
+    def forward(self, q, q_dot, action):
+        V = self.V_net(q)  # Potential
+        L = self.L_net(q).view(-1, q.shape[1], q.shape[1])  # Lower triangular for M = L @ L.T
+        M = L @ L.transpose(1, 2)
+        # Simplified Lagrangian residual (ddq from Newton's via inverse M)
+        # Add Coriolis/G terms if needed
+        predicted_accel = torch.linalg.solve(M, action.unsqueeze(-1)).squeeze(-1)  # Solve M * ddq = tau (action as torque)
+        return predicted_accel, V  # For energy checks
 
 class DDPG_PINN(TD3):
     """
@@ -68,11 +83,13 @@ class DDPG_PINN(TD3):
         replay_buffer_class: Optional[type[ReplayBuffer]] = None,
         replay_buffer_kwargs: Optional[dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
-        physics_type: str = 'none',  # 'none', 'energy_conservation', 'newtons_laws'
-        lambda_phys: float = 0.1,
+        physics_type: str = 'navier_stokes',#'navier_stokes',  # 'none', 'energy_conservation', 'newtons_laws', 'navier_stokes'
+        lambda_phys: float = 0.9,  # Weight for physics loss
         mass: float = 1.0,
         gravity: float = 9.81,
         length: float = 1.0,
+        viscosity: float = 0.01,  # Analogous to market friction
+        density: float = 1.0,     # Asset "density"
         dt: float = 0.05,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
@@ -114,6 +131,8 @@ class DDPG_PINN(TD3):
         self.mass = mass
         self.gravity = gravity
         self.length = length
+        self.viscosity = viscosity
+        self.density = density  # For Navier-Stokes analogy
         self.dt = dt
 
         # Use only one critic as in standard DDPG
@@ -123,52 +142,104 @@ class DDPG_PINN(TD3):
         if _init_setup_model:
             self._setup_model()
 
-    def _compute_physics_loss(self, observations: th.Tensor, actions: th.Tensor, next_observations: th.Tensor) -> th.Tensor:
+    def _compute_physics_loss(self, observations: th.Tensor, actions: th.Tensor,
+                              next_observations: th.Tensor) -> th.Tensor:
         """
         Compute the physics-informed loss based on the selected type.
 
         Assumes specific state formats:
         - For pendulum (energy_conservation): state = [theta, theta_dot]
         - For robotics (newtons_laws): state = [position, velocity], action = force/torque
+        - For financial markets (navier_stokes): state includes price histories, actions as forces
 
-        :param observations: Current states (batch_size, obs_dim)
-        :param actions: Actions (batch_size, act_dim)
-        :param next_observations: Next states (batch_size, obs_dim)
+        :param observations: Current states (batch_size, window_size, n_features * n_assets)
+        :param actions: Actions (batch_size, n_assets)
+        :param next_observations: Next states (batch_size, window_size, n_features * n_assets)
         :return: Physics loss tensor (scalar)
         """
         if self.physics_type == 'energy_conservation':
-            # For pendulum: energy = KE (kinetic energy/ Động Năng) + PE (Potential Energy/ Thế Năng)
-            # KE = 0.5 * m * l^2 * theta_dot^2
-            # PE = -m * g * l * cos(theta)
+            if observations.shape[1] < 2:
+                raise ValueError("Energy conservation requires at least 2D state [theta, theta_dot]")
             theta, theta_dot = observations[:, 0], observations[:, 1]
             next_theta, next_theta_dot = next_observations[:, 0], next_observations[:, 1]
-
-            energy = 0.5 * self.mass * self.length**2 * theta_dot**2 - self.mass * self.gravity * self.length * th.cos(theta)
-            next_energy = 0.5 * self.mass * self.length**2 * next_theta_dot**2 - self.mass * self.gravity * self.length * th.cos(next_theta)
-
-            # Penalize energy change (accounting for action work; here simplified as MSE on delta_energy)
-            # Optionally add work = action * theta_dot * dt for torque input
+            energy = 0.5 * self.mass * self.length ** 2 * theta_dot ** 2 - self.mass * self.gravity * self.length * th.cos(
+                theta)
+            next_energy = 0.5 * self.mass * self.length ** 2 * next_theta_dot ** 2 - self.mass * self.gravity * self.length * th.cos(
+                next_theta)
             delta_energy = next_energy - energy
             physics_loss = (delta_energy ** 2).mean()
 
+# In ddpg_pinn.py, inside the _compute_physics_loss method...
+
+
         elif self.physics_type == 'newtons_laws':
-            # For robotics: F = m * a, where a = (v_next - v) / dt
-            # Assume state = [pos, vel], action = force
-            velocity = observations[:, -1]  # Last dim as velocity (adjust indices as needed)
-            next_velocity = next_observations[:, -1]
-
+            # The number of assets is derived from the action space dimension
+            n_assets = actions.shape[1]
+            # --- FIX STARTS HERE ---
+            # We will use the 'ret1' feature (1-day return) as our proxy for "velocity".
+            # In your feature list, 'ret1' is the 6th feature (index 5).
+            # The observation tensor is structured as [feat1_asset1, feat1_asset2..., feat2_asset1, ...].
+            velocity_feature_index = 5  # Index of 'ret1'
+            # Calculate the correct slice to extract the 'ret1' feature for all assets
+            start_index = velocity_feature_index * n_assets
+            end_index = start_index + n_assets
+            # Extract the 'ret1' data from the most recent time step in the window
+            velocity = observations[:, -1, start_index:end_index]
+            next_velocity = next_observations[:, -1, start_index:end_index]
+            # --- FIX ENDS HERE ---
+            # Now, 'velocity' and 'next_velocity' both have the correct shape: [batch_size, 10]
+            # "Observed" acceleration from the market data
             accel = (next_velocity - velocity) / self.dt
-            predicted_accel = actions.squeeze() / self.mass  # Assume action is force (1D for simplicity)
-
+            # "Predicted" acceleration from the agent's actions (forces)
+            predicted_accel = actions / self.mass
+            # The loss can now be calculated correctly as both tensors match in shape
             physics_loss = F.mse_loss(predicted_accel, accel)
 
-        else:  # 'none' or fallback to smoothness
+        elif self.physics_type == 'navier_stokes':
+            # Reshape observations to (batch, window, features, assets) to correctly process the data
+            batch_size, window_size, n_flat_features = observations.shape
+            n_assets = actions.shape[1]
+            if n_flat_features % n_assets != 0:
+                raise ValueError(
+                    f"Observation features ({n_flat_features}) are not a multiple of the number of assets ({n_assets}).")
+            n_features = n_flat_features // n_assets
+
+            obs_reshaped = observations.view(batch_size, window_size, n_features, n_assets)
+            next_obs_reshaped = next_observations.view(batch_size, window_size, n_features, n_assets)
+
+            # Use 'close' price (feature index 3) velocity as 'u' and 'actions' as pressure 'p'
+            close_t = obs_reshaped[:, -1, 3, :]
+            close_t_minus_1 = obs_reshaped[:, -2, 3, :]
+            u = (close_t - close_t_minus_1) / self.dt  # Velocity u at time t
+
+            next_close_t = next_obs_reshaped[:, -1, 3, :]
+            next_close_t_minus_1 = next_obs_reshaped[:, -2, 3, :]
+            u_next = (next_close_t - next_close_t_minus_1) / self.dt  # Velocity u at time t+1
+
+            # Navier-Stokes analogy terms
+            du_dx = (u[:, 1:] - u[:, :-1]) / 1.0  # Spatial gradient of u (across assets)
+            du2_dx2 = (du_dx[:, 1:] - du_dx[:, :-1]) / 1.0  # Second spatial gradient
+            dp_dx = (actions[:, 1:] - actions[:, :-1]) / self.density / 1.0  # Pressure gradient
+
+            # Continuity equation residual
+            continuity_res = du_dx.abs().mean(dim=1)
+
+            # Momentum equation terms (ensuring all tensors have shape [batch_size, n_assets - 2])
+            du_dt = (u_next[:, :-2] - u[:, :-2]) / self.dt
+            conv_term = u[:, :-2] * du_dx[:, :-1]
+            visc_term = self.viscosity * du2_dx2
+            press_term = dp_dx[:, :-1]
+            force_term = actions[:, :-2]  # External force from actions
+
+            momentum_res = du_dt + conv_term + press_term - visc_term - force_term
+            physics_loss = (continuity_res ** 2).mean() + (momentum_res ** 2).mean()
+
+        else:  # 'none' or smoothness
             actions_pi = self.actor(observations)
             actions_pi_next = self.actor(next_observations)
             physics_loss = F.mse_loss(actions_pi, actions_pi_next)
 
         return physics_loss
-
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
         """
         Train the DDPG agent with a physics-informed loss added to the actor update.
@@ -256,4 +327,4 @@ class DDPG_PINN(TD3):
             tb_log_name=tb_log_name,
             reset_num_timesteps=reset_num_timesteps,
             progress_bar=progress_bar,
-        )https://www.amazon.com/ref=nav_logo#
+        )
