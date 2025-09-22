@@ -27,10 +27,13 @@ $$
 
 where:
 
-\begin{itemize}
-    \item Force (F): Actions applied per asset. This force is modeled by the agent's actions, such as batch size or the number of assets.
-    \item Mass (m): A hyperparameter represents "inertia" or resistance to change in asset dynamics.
-    \item Velocity (v): Proxied by the 1-day return (\texttt{ret1}) feature, extracted from observations for each asset. This assumes observations are historical windows of market data: including open, high, low, close, volume of an asset.
-    \item Acceleration ($\hat{a},a^*$): Rate of change in velocity, computed over a time step dt (default 0.05, analogous to a trading interval).
-    \item N: Total elements (Batch size multiplies with number of assets).
-\end{itemize}
+Force (F): Actions applied per asset. This force is modeled by the agent's actions, such as batch size or the number of assets.
+
+Mass (m): A hyperparameter represents "inertia" or resistance to change in asset dynamics.
+
+Velocity (v): Proxied by the 1-day return (\texttt{ret1}) feature, extracted from observations for each asset. This assumes observations are historical windows of market data: including open, high, low, close, volume of an asset.
+
+Acceleration ($\hat{a},a^*$): Rate of change in velocity, computed over a time step dt (default 0.05, analogous to a trading interval).
+
+N: Total elements (Batch size multiplies with number of assets).
+
