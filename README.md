@@ -9,21 +9,21 @@ This approach embeds a physics analogy into the reinforcement learning (RL) upda
 
 Observed Acceleration ($a^*$):
 
-\[
+$$
 a^* = \frac{\Delta v}{\Delta t} = \frac{v_{t+1}-v_t}{\Delta t}
-\]
+$$
 
 Predicted Acceleration ($\hat{a}$):
 
-\[
+$$
 F = m\times\hat{a} \Rightarrow \hat{a} = \frac{F}{m}
-\]
+$$
 
 Physics Loss:
 
-\[
+$$
 L_{\text{phys}} = \text{MSE}(\hat{a}, a^*) = \frac{1}{N} \sum_{i=1}^{N} (a_{\text{predicted},i} - a_{\text{observed},i})^2
-\]
+$$
 
 where:
 
