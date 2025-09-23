@@ -457,6 +457,9 @@ def run_portfolio_analysis(portfolio_spec: dict,
         "TD3_PINN": TD3_PINN, "PPO_PINN": PPO_PINN, "DDPG_PINN": DDPG_PINN,
         "PPO": PPO, "DDPG": DDPG, "TD3": TD3, "SAC": SAC
     }
+    # SB3_ALGOS = {
+    #     "PPO": PPO, "DDPG": DDPG, "TD3": TD3, "SAC": SAC
+    # }
 
     # Default train steps if not provided
     if train_steps_map is None:
@@ -500,7 +503,7 @@ def run_portfolio_analysis(portfolio_spec: dict,
         AlgoClass, kwargs = get_algo_and_kwargs(algo_name) if algo_name in ["PPO","DDPG","TD3","SAC"] else (Algo, {"seed": SEED, "verbose": 0})
 
         # Instantiate
-        if algo_name in ["PPO","DDPG","TD3","SAC"]:
+        if algo_name in ["PPO","DDPG","TD3","SAC", "DDPG_PINN"]:
             model = AlgoClass("MlpPolicy", env=train_env, **kwargs)
         else:
             # PINN classes in your repo usually accept just env + seed + verbose
