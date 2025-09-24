@@ -371,8 +371,8 @@ def run_portfolio_analysis(portfolio_spec: dict):
         return
 
     window_size = 5  # keep your original window; you can bump to 20 later if desired
-    # SB3_ALGOS = {"DDPG_PINN":DDPG_PINN,"TD3_PINN":TD3_PINN,"PPO_PINN":PPO_PINN,"PPO": PPO, "DDPG": DDPG, "TD3": TD3, "SAC": SAC}
-    SB3_ALGOS = {"DDPG_PINN":DDPG_PINN}
+    SB3_ALGOS = {"DDPG_PINN":DDPG_PINN,"TD3_PINN":TD3_PINN,"PPO_PINN":PPO_PINN,"PPO": PPO, "DDPG": DDPG, "TD3": TD3, "SAC": SAC}
+    #SB3_ALGOS = {"DDPG_PINN":DDPG_PINN}
     # SB3_ALGOS = {"PPO":PPO}
     # SB3_ALGOS = {}
     results = {}
@@ -386,7 +386,7 @@ def run_portfolio_analysis(portfolio_spec: dict):
             model = Algo(env=train_env, seed=SEED, verbose=0)
         else:
             model = Algo(policy="MlpPolicy", env=train_env, seed=SEED, verbose=0)
-        model.learn(total_timesteps=20_000)
+        model.learn(total_timesteps=100_000)
         print(f"{algo_name} training done.")
 
         eval_env = MultiAssetPortfolioEnv(test_df, assets, FEATURES, window_size)
