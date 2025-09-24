@@ -1,4 +1,4 @@
-This repository represents the research work we have done in redesigning traditional neural networks into Physics-Informed neural networks (PINNs) and applying these systems in the financial engineering field. Some of our contributions consist of:
+This repository represents the research work we have conducted in redesigning traditional neural networks into Physics-Informed Neural Networks (PINNs) and applying these systems in the field of financial engineering. Some of our contributions consist of:
 
 - Utilizing Newton's laws and Navier-Stokes Fluid Dynamic Theory to calculate the Physics Loss of the training process
 - Experimenting the redesigned PINNs with 3 10-asset portfolios from three different financial markets: USA, Vietnam, and China.
