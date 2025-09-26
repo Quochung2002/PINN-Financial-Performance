@@ -83,8 +83,8 @@ class DDPG_PINN(TD3):
         replay_buffer_class: Optional[type[ReplayBuffer]] = None,
         replay_buffer_kwargs: Optional[dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
-        physics_type: str = 'navier_stokes',#'navier_stokes',  # 'none', 'energy_conservation', 'newtons_laws', 'navier_stokes'
-        lambda_phys: float = 0.9,  # Weight for physics loss
+        physics_type: str = 'navier_stokes',#'newtons_laws',#'navier_stokes',  # 'none', 'energy_conservation', 'newtons_laws', 'navier_stokes'
+        lambda_phys: float = 0.1,
         mass: float = 1.0,
         gravity: float = 9.81,
         length: float = 1.0,
@@ -171,68 +171,69 @@ class DDPG_PINN(TD3):
 
 # In ddpg_pinn.py, inside the _compute_physics_loss method...
 
-
         elif self.physics_type == 'newtons_laws':
-            # The number of assets is derived from the action space dimension
             n_assets = actions.shape[1]
-            # --- FIX STARTS HERE ---
-            # We will use the 'ret1' feature (1-day return) as our proxy for "velocity".
-            # In your feature list, 'ret1' is the 6th feature (index 5).
-            # The observation tensor is structured as [feat1_asset1, feat1_asset2..., feat2_asset1, ...].
-            velocity_feature_index = 5  # Index of 'ret1'
-            # Calculate the correct slice to extract the 'ret1' feature for all assets
+            # ret1 is feature index 5 in your feature order: base(5) + 'ret1'(0) => 5
+            velocity_feature_index = 5
             start_index = velocity_feature_index * n_assets
             end_index = start_index + n_assets
-            # Extract the 'ret1' data from the most recent time step in the window
+
+            # Last step in window
             velocity = observations[:, -1, start_index:end_index]
             next_velocity = next_observations[:, -1, start_index:end_index]
-            # --- FIX ENDS HERE ---
-            # Now, 'velocity' and 'next_velocity' both have the correct shape: [batch_size, 10]
-            # "Observed" acceleration from the market data
+
+            # Use dt consistent with data cadence (daily -> ~1.0)
             accel = (next_velocity - velocity) / self.dt
-            # "Predicted" acceleration from the agent's actions (forces)
-            predicted_accel = actions / self.mass
-            # The loss can now be calculated correctly as both tensors match in shape
-            physics_loss = F.mse_loss(predicted_accel, accel)
+            predicted_accel = actions / (self.mass + 1e-8)
+
+            # --- scale to unit variance (dimensionless) ---
+            # Typical scale of accel in equities is tiny; normalize per batch:
+            accel_scale = accel.detach().std(dim=0).mean() + 1e-6
+            accel_n = accel / accel_scale
+            pred_n = predicted_accel / accel_scale
+
+            physics_loss = F.mse_loss(pred_n, accel_n)
+
 
         elif self.physics_type == 'navier_stokes':
-            # Reshape observations to (batch, window, features, assets) to correctly process the data
             batch_size, window_size, n_flat_features = observations.shape
             n_assets = actions.shape[1]
             if n_flat_features % n_assets != 0:
-                raise ValueError(
-                    f"Observation features ({n_flat_features}) are not a multiple of the number of assets ({n_assets}).")
+                raise ValueError("Obs features not multiple of assets.")
             n_features = n_flat_features // n_assets
 
             obs_reshaped = observations.view(batch_size, window_size, n_features, n_assets)
             next_obs_reshaped = next_observations.view(batch_size, window_size, n_features, n_assets)
 
-            # Use 'close' price (feature index 3) velocity as 'u' and 'actions' as pressure 'p'
+            # close index = 3 (open, high, low, close, volume, ret1, …)
             close_t = obs_reshaped[:, -1, 3, :]
-            close_t_minus_1 = obs_reshaped[:, -2, 3, :]
-            u = (close_t - close_t_minus_1) / self.dt  # Velocity u at time t
+            close_tm1 = obs_reshaped[:, -2, 3, :]
+            u = (close_t - close_tm1) / self.dt
 
             next_close_t = next_obs_reshaped[:, -1, 3, :]
-            next_close_t_minus_1 = next_obs_reshaped[:, -2, 3, :]
-            u_next = (next_close_t - next_close_t_minus_1) / self.dt  # Velocity u at time t+1
+            next_close_tm1 = next_obs_reshaped[:, -2, 3, :]
+            u_next = (next_close_t - next_close_tm1) / self.dt
 
-            # Navier-Stokes analogy terms
-            du_dx = (u[:, 1:] - u[:, :-1]) / 1.0  # Spatial gradient of u (across assets)
-            du2_dx2 = (du_dx[:, 1:] - du_dx[:, :-1]) / 1.0  # Second spatial gradient
-            dp_dx = (actions[:, 1:] - actions[:, :-1]) / self.density / 1.0  # Pressure gradient
+            du_dx = (u[:, 1:] - u[:, :-1])
+            du2_dx2 = (du_dx[:, 1:] - du_dx[:, :-1])
+            dp_dx = (actions[:, 1:] - actions[:, :-1]) / (self.density + 1e-8)
 
-            # Continuity equation residual
             continuity_res = du_dx.abs().mean(dim=1)
 
-            # Momentum equation terms (ensuring all tensors have shape [batch_size, n_assets - 2])
             du_dt = (u_next[:, :-2] - u[:, :-2]) / self.dt
             conv_term = u[:, :-2] * du_dx[:, :-1]
             visc_term = self.viscosity * du2_dx2
             press_term = dp_dx[:, :-1]
-            force_term = actions[:, :-2]  # External force from actions
+            force_term = actions[:, :-2]
 
             momentum_res = du_dt + conv_term + press_term - visc_term - force_term
-            physics_loss = (continuity_res ** 2).mean() + (momentum_res ** 2).mean()
+
+            # --- dimensionless (z-scored) residuals ---
+            cont_n = (continuity_res - continuity_res.mean()) / (continuity_res.std() + 1e-8)
+            mom_n = (momentum_res - momentum_res.mean()) / (momentum_res.std() + 1e-8)
+
+            physics_loss = (cont_n ** 2).mean() + (mom_n ** 2).mean()
+
 
         else:  # 'none' or smoothness
             actions_pi = self.actor(observations)
@@ -287,8 +288,16 @@ class DDPG_PINN(TD3):
 
             # Physics-informed loss
             physics_loss = self._compute_physics_loss(replay_data.observations, actions_pi, replay_data.next_observations)
+            # if self._n_updates % 1000 == 0:  # Log every 100 updates
+            #     print(
+            #         f"Update {self._n_updates}: Actor Loss = {actor_loss.item():.4f}, Physics Loss = {physics_loss.item():.4f}")
+            #     self.logger.record("train/raw_actor_loss", actor_loss.item())
+            #     self.logger.record("train/raw_physics_loss", physics_loss.item())
             physics_losses.append(physics_loss.item())
-
+            with th.no_grad():
+                actor_loss_magnitude = th.abs(actor_loss)
+                physics_loss_magnitude = th.abs(physics_loss)
+                scale_factor = actor_loss_magnitude / (physics_loss_magnitude + 1e-8)
             # Combined actor loss
             total_actor_loss = actor_loss + self.lambda_phys * physics_loss
             actor_losses.append(total_actor_loss.item())
