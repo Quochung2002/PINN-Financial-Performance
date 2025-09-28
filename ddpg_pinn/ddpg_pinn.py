@@ -299,7 +299,7 @@ class DDPG_PINN(TD3):
                 physics_loss_magnitude = th.abs(physics_loss)
                 scale_factor = actor_loss_magnitude / (physics_loss_magnitude + 1e-8)
             # Combined actor loss
-            total_actor_loss = actor_loss + self.lambda_phys * physics_loss
+            total_actor_loss = actor_loss + self.lambda_phys *scale_factor* physics_loss
             actor_losses.append(total_actor_loss.item())
 
             # Optimize actor
