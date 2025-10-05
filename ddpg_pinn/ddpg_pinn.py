@@ -2,8 +2,9 @@ from typing import Any, Optional, TypeVar, Union
 import numpy as np
 import torch
 import torch as th
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
+
 from stable_baselines.common.buffers import ReplayBuffer
 from stable_baselines.common.noise import ActionNoise
 from stable_baselines.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -13,58 +14,30 @@ from stable_baselines.common.utils import polyak_update
 
 SelfDDPG = TypeVar("SelfDDPG", bound="DDPG_PINN")
 
+
 class SimpleLNN(nn.Module):
     def __init__(self, state_dim, hidden_dim=64):
         super().__init__()
-        self.V_net = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))  # Potential energy
+        self.V_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)  # Potential energy
+        )
         self.L_net = nn.Linear(state_dim, state_dim * state_dim)  # For mass matrix (lower triangular)
 
     def forward(self, q, q_dot, action):
         V = self.V_net(q)  # Potential
         L = self.L_net(q).view(-1, q.shape[1], q.shape[1])  # Lower triangular for M = L @ L.T
         M = L @ L.transpose(1, 2)
-        # Simplified Lagrangian residual (ddq from Newton's via inverse M)
-        # Add Coriolis/G terms if needed
-        predicted_accel = torch.linalg.solve(M, action.unsqueeze(-1)).squeeze(-1)  # Solve M * ddq = tau (action as torque)
+        predicted_accel = torch.linalg.solve(M, action.unsqueeze(-1)).squeeze(-1)  # Solve M * ddq = tau
         return predicted_accel, V  # For energy checks
+
 
 class DDPG_PINN(TD3):
     """
-    Deep Deterministic Policy Gradient (DDPG) with Physics-Informed Neural Network (PINN) enhancements.
-
-    Deterministic Policy Gradient: http://proceedings.mlr.press/v32/silver14.pdf
-    DDPG Paper: https://arxiv.org/abs/1509.02971
-    Introduction to DDPG: https://spinningup.openai.com/en/latest/algorithms/ddpg.html
-
-    This implementation extends DDPG by incorporating a physics-informed loss in the actor update,
-    such as energy conservation for pendulum-like environments or Newton's laws for robotics.
-    The specific physics loss can be toggled via the `physics_type` parameter.
-
-    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
-    :param env: The environment to learn from (if registered in Gym, can be str)
-    :param learning_rate: Learning rate for adam optimizer, can be a function of progress (1 to 0)
-    :param buffer_size: Size of the replay buffer
-    :param learning_starts: Steps to collect transitions before learning starts
-    :param batch_size: Minibatch size for each gradient update
-    :param tau: Soft update coefficient ("Polyak update", between 0 and 1)
-    :param gamma: Discount factor
-    :param train_freq: Update frequency, can be int or tuple (e.g., (5, "step"))
-    :param gradient_steps: Number of gradient steps per rollout, -1 for as many as env steps
-    :param action_noise: Action noise type for exploration (e.g., from common.noise)
-    :param replay_buffer_class: Custom replay buffer class (e.g., HerReplayBuffer)
-    :param replay_buffer_kwargs: Keyword args for replay buffer creation
-    :param optimize_memory_usage: Enable memory-efficient replay buffer variant
-    :param physics_type: Type of physics constraint ('none', 'energy_conservation', 'newtons_laws')
-    :param lambda_phys: Weight for the physics-informed loss (default: 0.1)
-    :param mass: Mass parameter for physics calculations (e.g., for pendulum or robotics)
-    :param gravity: Gravity constant for pendulum energy (default: 9.81)
-    :param length: Pendulum length for energy calculation (default: 1.0)
-    :param dt: Time step for acceleration calculations in Newton's laws (default: 0.05)
-    :param policy_kwargs: Additional arguments for policy creation
-    :param verbose: Verbosity level (0: none, 1: info, 2: debug)
-    :param seed: Seed for pseudo-random generators
-    :param device: Device to run on (cpu, cuda, auto)
-    :param _init_setup_model: Whether to build the network on instantiation
+    DDPG with a Physics-Informed term on the actor loss.
+    Improvements: Enhanced adaptive weighting with variance consideration, optional Black-Scholes residual for finance,
+    better normalization with separate EMAs for stability, and regime-detection proxy via volatility clustering.
     """
 
     def __init__(
@@ -72,7 +45,7 @@ class DDPG_PINN(TD3):
         policy: Union[str, type[TD3Policy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 1e-3,
-        buffer_size: int = 1_000_000,  # 1e6
+        buffer_size: int = 1_000_000,
         learning_starts: int = 100,
         batch_size: int = 256,
         tau: float = 0.005,
@@ -83,14 +56,16 @@ class DDPG_PINN(TD3):
         replay_buffer_class: Optional[type[ReplayBuffer]] = None,
         replay_buffer_kwargs: Optional[dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
-        physics_type: str = 'navier_stokes',#'newtons_laws',#'navier_stokes',  # 'none', 'energy_conservation', 'newtons_laws', 'navier_stokes'
+        physics_type: str = "newtons_laws",  # 'none', 'energy_conservation', 'newtons_laws', 'navier_stokes'
         lambda_phys: float = 0.1,
         mass: float = 1.0,
         gravity: float = 9.81,
         length: float = 1.0,
         viscosity: float = 0.01,  # Analogous to market friction
         density: float = 1.0,     # Asset "density"
-        dt: float = 0.05,
+        dt: float = 1.0,          # Use 1.0 for daily bars
+        risk_free_rate: float = 0.05,  # For Black-Scholes
+        volatility_penalty: float = 0.1,  # Penalty for high volatility regimes
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[dict[str, Any]] = None,
         verbose: int = 0,
@@ -118,206 +93,187 @@ class DDPG_PINN(TD3):
             device=device,
             seed=seed,
             optimize_memory_usage=optimize_memory_usage,
-            # DDPG-specific settings (removing TD3 tricks)
+            # DDPG specifics: single critic, no delayed updates
             policy_delay=1,
             target_noise_clip=0.0,
             target_policy_noise=0.1,
             _init_setup_model=False,
         )
 
-        # Physics-informed parameters
         self.physics_type = physics_type
         self.lambda_phys = lambda_phys
         self.mass = mass
         self.gravity = gravity
         self.length = length
         self.viscosity = viscosity
-        self.density = density  # For Navier-Stokes analogy
+        self.density = density
         self.dt = dt
+        self.risk_free_rate = risk_free_rate
+        self.volatility_penalty = volatility_penalty
 
-        # Use only one critic as in standard DDPG
-        if "n_critics" not in self.policy_kwargs:
-            self.policy_kwargs["n_critics"] = 1
+        # Enhanced normalization: Separate EMAs for mean and variance
+        self._actor_mean_ema = 0.0
+        self._actor_var_ema = 1.0
+        self._phys_mean_ema = 0.0
+        self._phys_var_ema = 1.0
+        self._ema_beta = 0.995  # Smoother EMA for stability
+
+        # Regime proxy: EMA volatility
+        self._vol_ema = 0.0
+        self._vol_beta = 0.9
 
         if _init_setup_model:
             self._setup_model()
 
-    def _compute_physics_loss(self, observations: th.Tensor, actions: th.Tensor,
-                              next_observations: th.Tensor) -> th.Tensor:
-        """
-        Compute the physics-informed loss based on the selected type.
+    def _compute_physics_loss(self, observations: th.Tensor, actions: th.Tensor, next_observations: th.Tensor) -> th.Tensor:
+        physics_loss = th.tensor(0.0, device=self.device)
 
-        Assumes specific state formats:
-        - For pendulum (energy_conservation): state = [theta, theta_dot]
-        - For robotics (newtons_laws): state = [position, velocity], action = force/torque
-        - For financial markets (navier_stokes): state includes price histories, actions as forces
+        batch_size = observations.shape[0]
+        n_assets = actions.shape[1]
 
-        :param observations: Current states (batch_size, window_size, n_features * n_assets)
-        :param actions: Actions (batch_size, n_assets)
-        :param next_observations: Next states (batch_size, window_size, n_features * n_assets)
-        :return: Physics loss tensor (scalar)
-        """
-        if self.physics_type == 'energy_conservation':
-            if observations.shape[1] < 2:
-                raise ValueError("Energy conservation requires at least 2D state [theta, theta_dot]")
-            theta, theta_dot = observations[:, 0], observations[:, 1]
-            next_theta, next_theta_dot = next_observations[:, 0], next_observations[:, 1]
-            energy = 0.5 * self.mass * self.length ** 2 * theta_dot ** 2 - self.mass * self.gravity * self.length * th.cos(
-                theta)
-            next_energy = 0.5 * self.mass * self.length ** 2 * next_theta_dot ** 2 - self.mass * self.gravity * self.length * th.cos(
-                next_theta)
-            delta_energy = next_energy - energy
+        window_size = self.observation_space.shape[0]
+        features_per_step = self.observation_space.shape[1]
+
+        if n_assets == 0:
+            return physics_loss
+
+        n_features = features_per_step // n_assets
+
+        try:
+            obs_reshaped = observations.view(batch_size, window_size, n_assets, n_features)
+            next_obs_reshaped = next_observations.view(batch_size, window_size, n_assets, n_features)
+        except RuntimeError as e:
+            if self.verbose > 0:
+                print(f"Error reshaping physics tensors: {e}")
+            return physics_loss
+
+        # Compute returns (velocity analogy)
+        returns = (next_obs_reshaped[:, -1, :, 3] - obs_reshaped[:, -1, :, 3]) / obs_reshaped[:, -1, :, 3]  # Assuming close at index 3
+
+        # Update volatility EMA
+        with th.no_grad():
+            batch_vol = returns.std(dim=1).mean()
+            self._vol_ema = self._vol_beta * self._vol_ema + (1 - self._vol_beta) * batch_vol.item()
+
+        if self.physics_type == "black_scholes":
+            # Black-Scholes PDE residual for option-like pricing in portfolio
+            S = obs_reshaped[:, -1, :, 3]  # Prices
+            dS_dt = returns / self.dt  # Approximate partial V/partial t ~ returns
+            sigma = th.std(returns, dim=1, keepdim=True)  # Batch volatility
+
+            # Use actor output as proxy for delta (hedge ratio)
+            delta = actions  # Partial V/partial S ~ allocation
+
+            # Second derivative approximation (finite diff across assets)
+            d_delta_dS = (delta[:, 1:] - delta[:, :-1]) / (S[:, 1:] - S[:, :-1] + 1e-8)
+            gamma = (d_delta_dS[:, 1:] + d_delta_dS[:, :-1]) / (S[:, :-2] + 1e-8)  # Approx d2V/dS2
+
+            # BS residual
+            bs_res = dS_dt + self.risk_free_rate * S[:, :-2] * delta[:, :-2] + 0.5 * sigma[:, :-2]**2 * S[:, :-2]**2 * gamma - self.risk_free_rate * actions[:, :-2]
+            physics_loss = (bs_res ** 2).mean() + self.volatility_penalty * sigma.mean()**2  # Add vol penalty for regime
+
+        elif self.physics_type == "navier_stokes":
+            # Existing NS, with added Laplacian computation
+            velocity = returns
+            laplacian = th.zeros_like(velocity)
+            for i in range(1, n_assets - 1):
+                laplacian[:, i] = (velocity[:, i-1] - 2 * velocity[:, i] + velocity[:, i+1])
+
+            ns_residual = velocity + self.dt * (actions - (self.viscosity / self.density) * laplacian)
+            physics_loss = F.mse_loss(ns_residual, th.zeros_like(ns_residual)) + self.volatility_penalty * (velocity.var(dim=1).mean())
+
+        elif self.physics_type == "energy_conservation":
+            kinetic = 0.5 * self.mass * (returns ** 2).mean(dim=1)
+            potential = self.gravity * self.length * (1 - th.cos(obs_reshaped[:, -1, :, 3]))  # Pendulum analogy
+            delta_energy = kinetic.unsqueeze(1) + potential - (kinetic.unsqueeze(1) + potential).roll(1, dims=1)
             physics_loss = (delta_energy ** 2).mean()
 
-# In ddpg_pinn.py, inside the _compute_physics_loss method...
+        elif self.physics_type == "newtons_laws":
+            acceleration = returns / self.dt
+            predicted_accel = actions / self.mass
+            physics_loss = F.mse_loss(predicted_accel, acceleration)
 
-        elif self.physics_type == 'newtons_laws':
-            n_assets = actions.shape[1]
-            # ret1 is feature index 5 in your feature order: base(5) + 'ret1'(0) => 5
-            velocity_feature_index = 5
-            start_index = velocity_feature_index * n_assets
-            end_index = start_index + n_assets
-
-            # Last step in window
-            velocity = observations[:, -1, start_index:end_index]
-            next_velocity = next_observations[:, -1, start_index:end_index]
-
-            # Use dt consistent with data cadence (daily -> ~1.0)
-            accel = (next_velocity - velocity) / self.dt
-            predicted_accel = actions / (self.mass + 1e-8)
-
-            # --- scale to unit variance (dimensionless) ---
-            # Typical scale of accel in equities is tiny; normalize per batch:
-            accel_scale = accel.detach().std(dim=0).mean() + 1e-6
-            accel_n = accel / accel_scale
-            pred_n = predicted_accel / accel_scale
-
-            physics_loss = F.mse_loss(pred_n, accel_n)
-
-
-        elif self.physics_type == 'navier_stokes':
-            batch_size, window_size, n_flat_features = observations.shape
-            n_assets = actions.shape[1]
-            if n_flat_features % n_assets != 0:
-                raise ValueError("Obs features not multiple of assets.")
-            n_features = n_flat_features // n_assets
-
-            obs_reshaped = observations.view(batch_size, window_size, n_features, n_assets)
-            next_obs_reshaped = next_observations.view(batch_size, window_size, n_features, n_assets)
-
-            # close index = 3 (open, high, low, close, volume, ret1, …)
-            close_t = obs_reshaped[:, -1, 3, :]
-            close_tm1 = obs_reshaped[:, -2, 3, :]
-            u = (close_t - close_tm1) / self.dt
-
-            next_close_t = next_obs_reshaped[:, -1, 3, :]
-            next_close_tm1 = next_obs_reshaped[:, -2, 3, :]
-            u_next = (next_close_t - next_close_tm1) / self.dt
-
-            du_dx = (u[:, 1:] - u[:, :-1])
-            du2_dx2 = (du_dx[:, 1:] - du_dx[:, :-1])
-            dp_dx = (actions[:, 1:] - actions[:, :-1]) / (self.density + 1e-8)
-
-            continuity_res = du_dx.abs().mean(dim=1)
-
-            du_dt = (u_next[:, :-2] - u[:, :-2]) / self.dt
-            conv_term = u[:, :-2] * du_dx[:, :-1]
-            visc_term = self.viscosity * du2_dx2
-            press_term = dp_dx[:, :-1]
-            force_term = actions[:, :-2]
-
-            momentum_res = du_dt + conv_term + press_term - visc_term - force_term
-
-            # --- dimensionless (z-scored) residuals ---
-            cont_n = (continuity_res - continuity_res.mean()) / (continuity_res.std() + 1e-8)
-            mom_n = (momentum_res - momentum_res.mean()) / (momentum_res.std() + 1e-8)
-
-            physics_loss = (cont_n ** 2).mean() + (mom_n ** 2).mean()
-
-
-        else:  # 'none' or smoothness
-            actions_pi = self.actor(observations)
-            actions_pi_next = self.actor(next_observations)
-            physics_loss = F.mse_loss(actions_pi, actions_pi_next)
+        # Clamp for stability
+        physics_loss = th.clamp(physics_loss, 0.0, 10.0)
 
         return physics_loss
-    def train(self, gradient_steps: int, batch_size: int = 100) -> None:
-        """
-        Train the DDPG agent with a physics-informed loss added to the actor update.
 
-        :param gradient_steps: Number of gradient updates to perform
-        :param batch_size: Size of the minibatch sampled from the replay buffer
-        """
-        # Switch to train mode
-        self.policy.set_training_mode(True)
-
-        # Update learning rate
-        self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
-
-        actor_losses, critic_losses = [], []
+    def train(self, gradient_steps: int, batch_size: int) -> None:
+        actor_losses = []
+        critic_losses = []
         physics_losses = []
 
+        self._n_updates += gradient_steps
+
         for _ in range(gradient_steps):
-            self._n_updates += 1
-            # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
             with th.no_grad():
-                # Compute target Q-values (no noise in DDPG)
                 next_actions = self.actor_target(replay_data.next_observations)
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                next_q = self.critic_target(replay_data.next_observations, next_actions)[0]
+                target_q = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q
 
-            # Compute current Q-values
-            current_q_values = self.critic(replay_data.observations, replay_data.actions)
-
-            # Critic loss (standard MSE)
-            critic_loss = sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            current_q = self.critic(replay_data.observations, replay_data.actions)[0]
+            critic_loss = F.mse_loss(current_q, target_q)
             critic_losses.append(critic_loss.item())
 
-            # Optimize critic
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
+            th.nn.utils.clip_grad_norm_(self.critic.parameters(), 10.0)
             self.critic.optimizer.step()
 
-            # Actor update (with physics-informed loss)
-            # Standard actor loss
+            # Actor update with improved PIRL
             actions_pi = self.actor(replay_data.observations)
-            actor_loss = -self.critic.q1_forward(replay_data.observations, actions_pi).mean()
+            q1 = self.critic(replay_data.observations, actions_pi)[0]
 
-            # Physics-informed loss
-            physics_loss = self._compute_physics_loss(replay_data.observations, actions_pi, replay_data.next_observations)
-            # if self._n_updates % 1000 == 0:  # Log every 100 updates
-            #     print(
-            #         f"Update {self._n_updates}: Actor Loss = {actor_loss.item():.4f}, Physics Loss = {physics_loss.item():.4f}")
-            #     self.logger.record("train/raw_actor_loss", actor_loss.item())
-            #     self.logger.record("train/raw_physics_loss", physics_loss.item())
-            physics_losses.append(physics_loss.item())
+            # Update actor EMA stats
+            batch_mean = q1.mean().item()
+            batch_var = q1.var().item()
+            self._actor_mean_ema = self._ema_beta * self._actor_mean_ema + (1 - self._ema_beta) * batch_mean
+            self._actor_var_ema = self._ema_beta * self._actor_var_ema + (1 - self._ema_beta) * batch_var
+
+            # Normalized actor loss
+            actor_loss = - (q1 - self._actor_mean_ema) / th.sqrt(th.tensor(self._actor_var_ema) + 1e-6).to(self.device)
+
+            # Physics loss
+            physics_loss_raw = self._compute_physics_loss(
+                replay_data.observations, actions_pi, replay_data.next_observations
+            )
+            physics_losses.append(physics_loss_raw.item())
+
+            # Update physics EMA stats
+            self._phys_mean_ema = self._ema_beta * self._phys_mean_ema + (1 - self._ema_beta) * physics_loss_raw.item()
+            self._phys_var_ema = self._ema_beta * self._phys_var_ema + (1 - self._ema_beta) * physics_loss_raw.var().item()
+
+            # Normalized physics loss
+            physics_loss = (physics_loss_raw - self._phys_mean_ema) / th.sqrt(th.tensor(self._phys_var_ema) + 1e-6).to(self.device)
+
+            # Variance-aware adaptive lambda: Penalize high variance in physics for stability
             with th.no_grad():
-                actor_loss_magnitude = th.abs(actor_loss)
-                physics_loss_magnitude = th.abs(physics_loss)
-                scale_factor = actor_loss_magnitude / (physics_loss_magnitude + 1e-8)
-            # Combined actor loss
-            total_actor_loss = actor_loss + self.lambda_phys *scale_factor* physics_loss
+                a_mag = actor_loss.abs().mean()
+                p_mag = physics_loss.abs().mean()
+                p_var_penalty = physics_loss.var().clamp_min(1e-6).sqrt()
+                lambda_adapt = (a_mag / (p_mag + p_var_penalty)).clamp(0.1, 10.0) * self.lambda_phys
+
+            total_actor_loss = actor_loss.mean() + lambda_adapt * physics_loss.mean()
             actor_losses.append(total_actor_loss.item())
 
-            # Optimize actor
             self.actor.optimizer.zero_grad()
             total_actor_loss.backward()
+            th.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
             self.actor.optimizer.step()
 
-            # Update target networks
+            # Target updates
             polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
             polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
-            polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
-            polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
 
         # Logging
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         if actor_losses:
             self.logger.record("train/actor_loss", np.mean(actor_losses))
             self.logger.record("train/physics_loss", np.mean(physics_losses))
+            self.logger.record("train/lambda_adapt", lambda_adapt.item())
+            self.logger.record("train/vol_ema", self._vol_ema)
         self.logger.record("train/critic_loss", np.mean(critic_losses))
 
     def learn(
