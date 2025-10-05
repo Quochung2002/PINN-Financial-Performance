@@ -6,6 +6,7 @@
 import os
 import logging
 import numpy as np
+import time
 import pandas as pd
 import matplotlib.pyplot as plt
 import gymnasium as gym
@@ -19,12 +20,13 @@ if not hasattr(np, "alltrue"):
     np.alltrue = np.all
 
 # ---------- SB3 imports ------------------------------------------------------
-from stable_baselines3 import PPO, TD3, SAC, DDPG
+from stable_baselines3 import PPO, TD3, SAC, DDPG, A2C
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines.ddpg_pinn.ddpg_pinn import DDPG_PINN
 from stable_baselines.td3_pinn.td3_pinn import TD3_PINN
 from stable_baselines.ppo_pinn.ppo_pinn import PPO_PINN
+from stable_baselines.a2c_pinn.a2c_pinn import A2C_PINN
 
 # ---------- suppress TensorFlow clutter (pgportfolio) ------------------------
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -371,6 +373,7 @@ def run_portfolio_analysis(portfolio_spec: dict):
     """Runs the full pipeline for a given portfolio specification (training logic unchanged)."""
     name = portfolio_spec['name']
     assets = portfolio_spec['assets']
+    start_time = time.time()
     print(f"\n{'='*80}\nRunning Analysis for Portfolio: {name}\n{'='*80}")
 
     # --- Download + Engineer Features, then Split ---
@@ -390,8 +393,10 @@ def run_portfolio_analysis(portfolio_spec: dict):
         return
 
     window_size = 5  # keep your original window; you can bump to 20 later if desired
-    SB3_ALGOS = {"TD3_PINN":TD3_PINN,"PPO_PINN":PPO_PINN,"DDPG_PINN":DDPG_PINN,"PPO": PPO, "DDPG": DDPG, "TD3": TD3, "SAC": SAC}
-    # SB3_ALGOS = {"DDPG_PINN":DDPG_PINN}
+    SB3_ALGOS = {"TD3_PINN":TD3_PINN,"PPO_PINN":PPO_PINN,"DDPG_PINN":DDPG_PINN,"PPO": PPO, "DDPG": DDPG, "TD3": TD3, "SAC": SAC, "A2C":A2C, "A2C_PINN":A2C_PINN}
+    # SB3_ALGOS = {"TD3_PINN":TD3_PINN,"DDPG_PINN":DDPG_PINN, "DDPG": DDPG, "TD3": TD3}
+    # SB3_ALGOS = {"DDPG":DDPG, "DDPG_PINN":DDPG_PINN}
+    # SB3_ALGOS = {"A2C_PINN":A2C_PINN,"A2C":A2C}
     # SB3_ALGOS = {"PPO":PPO}
     # SB3_ALGOS = {}
     # per-algo training steps (single contiguous daily path, ~2k steps/episode)
@@ -399,7 +404,8 @@ def run_portfolio_analysis(portfolio_spec: dict):
         "PPO": 20_000, "PPO_PINN": 20_000,
         "TD3": 50_000, "TD3_PINN": 50_000,
         "SAC": 50_000,
-        "DDPG": 30_000, "DDPG_PINN": 30_000
+        "DDPG": 30_000, "DDPG_PINN": 30_000,
+        "A2C": 20_000, "A2C_PINN": 20_000
     }
     results = {}
     metrics_rows = []
@@ -438,9 +444,10 @@ def run_portfolio_analysis(portfolio_spec: dict):
     metrics_df = (
         pd.DataFrame(metrics_rows)
           .set_index("Algorithm")
-          .reindex(["PPO_PINN","TD3_PINN","DDPG_PINN","PPO","DDPG","TD3","SAC","UBAH","CRP","OLMAR","RMR","PAMR"])
+          .reindex(["PPO_PINN","TD3_PINN","DDPG_PINN","PPO","DDPG","TD3","SAC","UBAH","CRP","OLMAR","RMR","PAMR","A2C","A2C_PINN"])
           .round(2)
     )
+    end_time = time.time()
     print(f"\n----------------  Performance Comparison: {name}  ----------------")
     print(metrics_df.to_string())
 
@@ -456,20 +463,26 @@ def run_portfolio_analysis(portfolio_spec: dict):
     plt.ylabel("Portfolio Value ($)", fontsize=12)
     plt.legend(ncol=3, fontsize=10)
     plt.tight_layout()
-    plt.show()
+    plt.savefig(f"portfolio_wealth_{name}.png")
 
 if __name__ == "__main__":
     # Define the three portfolios with their specific assets and date ranges
     PORTFOLIOS = [
         {
             'name': 'S&P 100 (U.S.)',
-            'assets': ['NVDA', 'AAPL', 'GOOGL', 'AMZN', 'T', 'BAC', 'PFE', 'UNH', 'PYPL', 'KO'],
+            'assets': ['MSFT', 'INTC', 'BAC', 'DIS', 'PFE', 'LLY', 'NKE', 'VZ', 'WMT', 'AMGN'],
             'train_start': '2015-01-01', 'train_end': '2023-01-01',
             'test_start': '2023-01-02', 'test_end': '2025-01-01'
         },
+        # {
+        #     'name': 'FTSE 100 (U.K.)',
+        #     'assets': ['AAL.L', 'BATS.L', 'GLEN.L', 'BT-A.L', 'DGE.L', 'GSK.L', 'HSBA.L', 'RIO.L',  'LLOY.L', 'NG.L'],
+        #     'train_start': '2015-01-01', 'train_end': '2023-01-01',
+        #     'test_start': '2023-01-02', 'test_end': '2025-01-01'
+        # },
         {
             'name': 'VN100 (Vietnam)',
-            'assets': ['HPG.VN', 'VIX.VN', 'SSI.VN', 'DIG.VN', 'MSN.VN', 'STB.VN', 'VNM.VN', 'HSG.VN', 'FPT.VN', 'DPM.VN'],
+            'assets': ["DXG.VN", "HPG.VN", "SSI.VN", "DIG.VN", "EIB.VN", "VIX.VN", "FPT.VN", "VSC.VN", "DHG.VN", "MWG.VN"],
             'train_start': '2015-01-01', 'train_end': '2023-01-01',
             'test_start': '2023-01-02', 'test_end': '2025-01-01'
         },
