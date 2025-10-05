@@ -152,7 +152,7 @@ class PPO_PINN(PPO):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        physics_type: str = "navier_stokes",#"navier_stokes",
+        physics_type: str = "newtons_laws",#"navier_stokes",
         lambda_phys: float = 0.1,
         viscosity: float = 0.01,
         density: float = 1.0,
