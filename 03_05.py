@@ -109,11 +109,13 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50.0)
 
-def _bb_z(close: pd.Series, n: int = 20, k: float = 2.0) -> pd.Series:
+def _bbands(close: pd.Series, n: int = 20, k: float = 2.0):
     ma = close.rolling(n, min_periods=n).mean()
     sd = close.rolling(n, min_periods=n).std(ddof=0)
-    z = (close - ma) / (k * sd).replace(0, np.nan)
-    return z.clip(-3, 3).fillna(0.0)
+    upper = ma + k * sd
+    lower = ma - k * sd
+    return ma, upper, lower
+
 
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
     prev_close = close.shift(1)
@@ -148,6 +150,12 @@ def _roll_z(s: pd.Series, n: int = 60) -> pd.Series:
     m = s.rolling(n, min_periods=n).mean()
     sd = s.rolling(n, min_periods=n).std(ddof=0)
     return ((s - m) / sd.replace(0, np.nan)).fillna(0.0).clip(-5, 5)
+def _willr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
+    hh = high.rolling(n, min_periods=n).max()
+    ll = low.rolling(n, min_periods=n).min()
+    wr = -100 * (hh - close) / (hh - ll).replace(0, np.nan)
+    # Return classic %R in [-100, 0]; we’ll scale to [0,1] at feature time.
+    return wr.clip(-100, 0)
 
 def engineer_features(df: pd.DataFrame, assets: list[str]) -> tuple[pd.DataFrame, list[str]]:
     """
@@ -175,7 +183,12 @@ def engineer_features(df: pd.DataFrame, assets: list[str]) -> tuple[pd.DataFrame
         macd_sig = _ema(macd, 9)
         out[f"macd_{a}"]   = macd.fillna(0.0)
         out[f"macds_{a}"]  = macd_sig.fillna(0.0)
-        out[f"bbz20_{a}"]  = _bb_z(c, 20, 2.0)
+        bb_mid, bb_up, bb_low = _bbands(c, 20, 2.0)
+        # %B in [0,1] (clip for safety)
+        out[f"bbp20_{a}"] = ((c - bb_low) / (bb_up - bb_low).replace(0, np.nan)).clip(0, 1)
+        # Bandwidth (relative width); safe when ma>0
+        out[f"bbw20_{a}"] = ((bb_up - bb_low) / bb_mid.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(
+            0.0)
 
         # Volatility / trend strength
         out[f"atr14_{a}"]  = _atr(h, l, c, 14)
@@ -183,15 +196,18 @@ def engineer_features(df: pd.DataFrame, assets: list[str]) -> tuple[pd.DataFrame
 
         # Volume-derived
         lv = np.log(v)
-        out[f"volz60_{a}"] = _roll_z(lv, 60)
+
         out[f"obv_{a}"]    = _obv(c, v)
+        # Williams’ %R (14) — scaled to [0,1] for NN stability
+        # classic %R is [-100,0]; map to [0,1] via (wr + 100)/100
+        out[f"willr14_{a}"] = (_willr(h, l, c, 14) + 100.0) / 100.0
 
         # Normalize ATR by price for stability
         out[f"atr14_{a}"]  = (out[f"atr14_{a}"] / c.replace(0, np.nan)).fillna(0.0).clip(0, 0.2)
 
     # Feature order for stacking
     base = ["open", "high", "low", "close", "volume"]
-    tech = ["ret1", "ret5", "rvol20", "mom10", "rsi14", "macd", "macds", "bbz20", "atr14", "adx14", "volz60", "obv"]
+    tech = ["ret1", "ret5", "rvol20", "mom10", "rsi14", "macd", "macds", "bbp20", "atr14", "adx14", "willr14", "obv"]
     FEATURES = base + tech
 
     # Clean and trim warmup
@@ -199,7 +215,6 @@ def engineer_features(df: pd.DataFrame, assets: list[str]) -> tuple[pd.DataFrame
     out = out.iloc[60:].copy()  # drop early rows with heavy rolling NaNs
 
     return out, FEATURES
-
 # ----------------------------------------------------------------------------
 #                            RL ENVIRONMENT (features-ready)
 # ----------------------------------------------------------------------------
@@ -350,13 +365,22 @@ def simulate_pg_agent(agent_cls, price_data: np.ndarray, **kwargs):
 
     return wealth
 
-
-
 def compute_metrics(wealth, *, freq=252, risk_free_rate=0.0):
     wealth = np.asarray(wealth, dtype=float)
-    if wealth.size < 2: return {"APV": np.nan, "Ann.Return(%)": np.nan, "Ann.Vol(%)": np.nan, "Sharpe": np.nan, "MDD(%)": np.nan, "Calmar": np.nan}
+    if wealth.size < 2:
+        return {
+            "APV": np.nan, "Ann.Return(%)": np.nan, "Ann.Vol(%)": np.nan,
+            "Sharpe": np.nan, "MDD(%)": np.nan, "Calmar": np.nan,
+            "Cum.Return(%)": np.nan
+        }
     rets = np.diff(wealth) / wealth[:-1]
-    if rets.size == 0: return {"APV": wealth[-1], "Ann.Return(%)": 0, "Ann.Vol(%)": 0, "Sharpe": np.nan, "MDD(%)": 0, "Calmar": np.nan}
+    if rets.size == 0:
+        return {
+            "APV": wealth[-1], "Ann.Return(%)": 0, "Ann.Vol(%)": 0,
+            "Sharpe": np.nan, "MDD(%)": 0, "Calmar": np.nan,
+            "Cum.Return(%)": (wealth[-1] / wealth[0] - 1.0) * 100
+        }
+
     ann_return = (wealth[-1] / wealth[0]) ** (freq / rets.size) - 1.0
     ann_vol = np.std(rets, ddof=1) * np.sqrt(freq)
     sharpe = (ann_return - risk_free_rate) / ann_vol if ann_vol > 0 else np.nan
@@ -364,8 +388,20 @@ def compute_metrics(wealth, *, freq=252, risk_free_rate=0.0):
     drawdown = (wealth - running_max) / running_max
     mdd = drawdown.min()
     calmar = ann_return / abs(mdd) if mdd != 0 else np.nan
-    return {"APV": wealth[-1], "Ann.Return(%)": ann_return * 100, "Ann.Vol(%)": ann_vol * 100, "Sharpe": sharpe, "MDD(%)": mdd * 100, "Calmar": calmar}
 
+    # <-- cumulative return over the test window
+    cum_return = (wealth[-1] / wealth[0]) - 1.0
+
+    return {
+        "APV": wealth[-1],
+        "Ann.Return(%)": ann_return * 100,
+        "Ann.Vol(%)": ann_vol * 100,
+        "Sharpe": sharpe,
+        "MDD(%)": mdd * 100,
+        "Calmar": calmar,
+        "Cum.Return(%)": cum_return * 100,   # <-- shows up in your table
+    }
+    
 # ============================================================================
 #                         MAIN ANALYSIS PIPELINE
 # ============================================================================
@@ -482,7 +518,7 @@ if __name__ == "__main__":
         # },
         {
             'name': 'VN100 (Vietnam)',
-            'assets': ["DXG.VN", "HPG.VN", "SSI.VN", "DIG.VN", "EIB.VN", "VIX.VN", "FPT.VN", "VSC.VN", "DHG.VN", "MWG.VN"],
+            'assets': ["HPG.VN", "VIX.VN", "SSI.VN", "DIG.VN", "MSN.VN", "STB.VN", "VNM.VN", "HSG.VN", "FPT.VN", "DPM.VN"],
             'train_start': '2015-01-01', 'train_end': '2023-01-01',
             'test_start': '2023-01-02', 'test_end': '2025-01-01'
         },
