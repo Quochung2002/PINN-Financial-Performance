@@ -1,6 +1,6 @@
 from typing import Dict, List, Type, Union
 
-import torch
+import torch as th
 import torch.nn as nn
 from gymnasium import spaces
 from stable_baselines3.common.policies import ActorCriticPolicy
@@ -21,9 +21,9 @@ class KANLayer(nn.Module):
         self.spline_order = spline_order
         self.fourier_k = fourier_k  # Number of Fourier frequencies
 
-        self.grid = nn.Parameter(torch.linspace(-1, 1, grid_size + 2 * spline_order + 1).unsqueeze(0).unsqueeze(0), requires_grad=False)
+        self.grid = nn.Parameter(th.linspace(-1, 1, grid_size + 2 * spline_order + 1).unsqueeze(0).unsqueeze(0), requires_grad=False)
 
-        self.coefficients = nn.Parameter(torch.zeros(out_features, in_features, grid_size + spline_order))
+        self.coefficients = nn.Parameter(th.zeros(out_features, in_features, grid_size + spline_order))
 
         # Learnable scale for adaptive activation
         self.scale = nn.Parameter(th.ones(1))
@@ -31,12 +31,12 @@ class KANLayer(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        with torch.no_grad():
+        with th.no_grad():
             for i in range(self.out_features):
                 for j in range(self.in_features):
-                    self.coefficients[i, j] = torch.sin(torch.linspace(0, 2 * torch.pi, self.coefficients.shape[-1]))
+                    self.coefficients[i, j] = th.sin(th.linspace(0, 2 * th.pi, self.coefficients.shape[-1]))
 
-    def b_spline_basis(self, x: torch.Tensor, grid: torch.Tensor, order: int) -> torch.Tensor:
+    def b_spline_basis(self, x: th.Tensor, grid: th.Tensor, order: int) -> th.Tensor:
         x = x.unsqueeze(-1)
         if order == 0:
             return ((x >= grid[:, :-1]) & (x < grid[:, 1:])).float()
@@ -46,7 +46,7 @@ class KANLayer(nn.Module):
         right = (grid[:, order + 1 :] - x) / (grid[:, order + 1 :] - grid[:, 1:-(order - 1)]) * basis_lower[:, :, 1:]
         return left + right
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: th.Tensor) -> th.Tensor:
         # Add Fourier features
         if self.fourier_k > 0:
             freqs = th.arange(1, self.fourier_k + 1, device=x.device).unsqueeze(0).unsqueeze(2) * th.pi
@@ -55,7 +55,7 @@ class KANLayer(nn.Module):
             x = th.cat([x, fourier_sin.flatten(1), fourier_cos.flatten(1)], dim=-1)
 
         basis = self.b_spline_basis(x, self.grid, self.spline_order)
-        activations = torch.einsum('bid,oid->bo', basis, self.coefficients) * self.scale
+        activations = th.einsum('bid,oid->bo', basis, self.coefficients) * self.scale
         return activations
 
 class KANMlpExtractor(nn.Module):
@@ -67,7 +67,7 @@ class KANMlpExtractor(nn.Module):
         features_dim: int,
         net_arch: Union[List[int], Dict[str, List[int]]] = [256, 256],  # Wider default
         activation_fn: Type[nn.Module] = nn.ReLU,  # Ignored for KAN
-        device: Union[torch.device, str] = "auto",
+        device: Union[th.device, str] = "auto",
     ):
         super().__init__()
         policy_net: List[nn.Module] = []
@@ -103,10 +103,10 @@ class KANMlpExtractor(nn.Module):
         self.latent_dim_pi = last_layer_dim_pi
         self.latent_dim_vf = last_layer_dim_vf
 
-    def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+    def forward_actor(self, features: th.Tensor) -> th.Tensor:
         return self.policy_net(features)
 
-    def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+    def forward_critic(self, features: th.Tensor) -> th.Tensor:
         return self.value_net(features)
 
 class KANActorCriticPolicy(ActorCriticPolicy):
