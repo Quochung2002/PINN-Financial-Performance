@@ -294,15 +294,20 @@ class MultiAssetPortfolioEnv(gym.Env):
 # ----------------------------------------------------------------------------
 #                        SIMULATION & METRICS (unchanged)
 # ----------------------------------------------------------------------------
-def simulate_sb3_strategy(env: MultiAssetPortfolioEnv, model):
+def simulate_sb3_strategy(env: MultiAssetPortfolioEnv, model, return_actions: bool = False):
     obs, _ = env.reset()
     wealth = [1000.0]
+    actions = [] if return_actions else None
     done = False
     while not done:
         action, _ = model.predict(obs, deterministic=True)
+        if return_actions:
+            actions.append(action.copy())
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         wealth.append(wealth[-1] * (1 + reward))
+    if return_actions:
+        return wealth, actions
     return wealth
 
 def _simplex_project(w: np.ndarray) -> np.ndarray:
@@ -421,9 +426,15 @@ def run_portfolio_analysis(portfolio_spec: dict):
 
         # split AFTER feature engineering so indices/NaNs align
         train_df = full_df.loc[portfolio_spec['train_start']:portfolio_spec['train_end']].reset_index(drop=True)
+        # Define validation set: last 10% of training period (or at least 30 days)
+        val_split_idx = int(len(train_df) * 0.9)
+        if len(train_df) - val_split_idx < 30:
+            val_split_idx = max(0, len(train_df) - 30)
+        val_df = train_df.iloc[val_split_idx:].reset_index(drop=True)
+        train_df = train_df.iloc[:val_split_idx].reset_index(drop=True)
         test_df  = full_df.loc[portfolio_spec['test_start'] :portfolio_spec['test_end'] ].reset_index(drop=True)
 
-        if train_df.empty or test_df.empty or train_df.isnull().values.any() or test_df.isnull().values.any():
+        if train_df.empty or val_df.empty or test_df.empty or train_df.isnull().values.any() or val_df.isnull().values.any() or test_df.isnull().values.any():
             print(f"Data for {name} is missing or incomplete for the specified dates. Skipping analysis.")
             return
     except Exception as e:
@@ -455,7 +466,7 @@ def run_portfolio_analysis(portfolio_spec: dict):
     for algo_name, Algo in SB3_ALGOS.items():
         print(f"\n=== Training {algo_name} on {name} ===")
         train_env = DummyVecEnv([lambda: Monitor(MultiAssetPortfolioEnv(train_df, assets, FEATURES, window_size))])
-        if algo_name in ["PPO_PINN", "TD3_PINN", "DDPG_PINN", "A2C_PINN"]:
+        if algo_name in ["PPO_PINN", "TD3_PINN", "A2C_PINN"]:
             model = Algo(env=train_env, seed=SEED, verbose=0)
         else:
             model = Algo(policy="MlpPolicy", env=train_env, seed=SEED, verbose=0)
