@@ -1,8 +1,9 @@
-from typing import Dict, List, Type, Union
+from typing import Dict, List, Type, Union, Tuple
 
 import torch as th
 import torch.nn as nn
 from gymnasium import spaces
+from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.preprocessing import get_action_dim
@@ -10,105 +11,125 @@ from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines.common.policies import ActorCriticCnnPolicy, MultiInputActorCriticPolicy
 
 class KANLayer(nn.Module):
-    """
-    Kolmogorov-Arnold Network (KAN) Layer with Fourier features for better handling high-frequency data.
-    """
-    def __init__(self, in_features: int, out_features: int, grid_size: int = 5, spline_order: int = 3, fourier_k: int = 5):
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.grid_size = grid_size
-        self.spline_order = spline_order
-        self.fourier_k = fourier_k  # Number of Fourier frequencies
-
-        self.grid = nn.Parameter(th.linspace(-1, 1, grid_size + 2 * spline_order + 1).unsqueeze(0).unsqueeze(0), requires_grad=False)
-
-        self.coefficients = nn.Parameter(th.zeros(out_features, in_features, grid_size + spline_order))
-
-        # Learnable scale for adaptive activation
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.spline_order = 3  # k
+        self.grid_size = 5  # Number of grid intervals, adjustable
+        steps = self.grid_size + 1
+        grid = th.linspace(-1, 1, steps=steps).unsqueeze(0).expand(self.in_dim, steps)
+        self.grid = nn.Parameter(self.extend_grid(grid, k_extend=self.spline_order))
+        num_basis = self.grid_size + self.spline_order
+        self.spline_coeff = nn.Parameter(th.randn(self.in_dim, self.out_dim, num_basis))
+        self.base_weight = nn.Parameter(th.normal(0, 1, (self.in_dim, self.out_dim)))
         self.scale = nn.Parameter(th.ones(1))
+        self.silu = nn.SiLU()
 
-        self.reset_parameters()
+    def extend_grid(self, grid, k_extend):
+        h = (grid[:, -1] - grid[:, 0]) / (grid.shape[1] - 1)
+        h = h.unsqueeze(1)
+        for _ in range(k_extend):
+            grid = th.cat([grid[:, 0:1] - h, grid], dim=1)
+            grid = th.cat([grid, grid[:, -1:] + h], dim=1)
+        return grid
 
-    def reset_parameters(self):
-        with th.no_grad():
-            for i in range(self.out_features):
-                for j in range(self.in_features):
-                    self.coefficients[i, j] = th.sin(th.linspace(0, 2 * th.pi, self.coefficients.shape[-1]))
-
-    def b_spline_basis(self, x: th.Tensor, grid: th.Tensor, order: int) -> th.Tensor:
-        x = x.unsqueeze(-1)
+    def b_spline_basis(self, x, grid, order):
+        x = x.unsqueeze(2)
+        grid = grid.unsqueeze(0)
         if order == 0:
-            return ((x >= grid[:, :-1]) & (x < grid[:, 1:])).float()
+            value = ((x >= grid[:, :, :-1]) & (x < grid[:, :, 1:])).float()
+        else:
+            basis_lower = self.b_spline_basis(x[:, :, 0], grid[0], order - 1)
+            left_coef = (x - grid[:, :, :-(order + 1)]) / (grid[:, :, order:-1] - grid[:, :, :-(order + 1)])
+            left = left_coef * basis_lower[:, :, :-1]
+            right_coef = (grid[:, :, order + 1:] - x) / (grid[:, :, order + 1:] - grid[:, :, 1:-(order)])
+            right = right_coef * basis_lower[:, :, 1:]
+            value = left + right
+        return th.nan_to_num(value)
 
-        basis_lower = self.b_spline_basis(x, grid, order - 1)
-        left = (x - grid[:, :-order]) / (grid[:, order:] - grid[:, :-order]) * basis_lower[:, :, :-1]
-        right = (grid[:, order + 1 :] - x) / (grid[:, order + 1 :] - grid[:, 1:-(order - 1)]) * basis_lower[:, :, 1:]
-        return left + right
-
-    def forward(self, x: th.Tensor) -> th.Tensor:
-        # Add Fourier features
-        if self.fourier_k > 0:
-            freqs = th.arange(1, self.fourier_k + 1, device=x.device).unsqueeze(0).unsqueeze(2) * th.pi
-            fourier_sin = th.sin(freqs * x.unsqueeze(1))
-            fourier_cos = th.cos(freqs * x.unsqueeze(1))
-            x = th.cat([x, fourier_sin.flatten(1), fourier_cos.flatten(1)], dim=-1)
-
+    def forward(self, x):
+        silu = self.silu(x)
         basis = self.b_spline_basis(x, self.grid, self.spline_order)
-        activations = th.einsum('bid,oid->bo', basis, self.coefficients) * self.scale
-        return activations
+        spline = th.einsum('bij,ikj->bik', basis, self.spline_coeff)
+        base = silu[:, :, None] * self.base_weight[None, :, :]
+        y = base + spline
+        y = y * self.scale
+        y = y.sum(dim=1)
+        return y
 
 class KANMlpExtractor(nn.Module):
-    """
-    KAN-based MLP extractor for actor-critic policies with enhanced depth.
-    """
     def __init__(
         self,
-        features_dim: int,
-        net_arch: Union[List[int], Dict[str, List[int]]] = [256, 256],  # Wider default
-        activation_fn: Type[nn.Module] = nn.ReLU,  # Ignored for KAN
+        feature_dim: int,
+        net_arch: Union[List[Union[int, Dict[str, List[int]]]], Dict[str, List[int]]],
+        activation_fn: Type[nn.Module],
         device: Union[th.device, str] = "auto",
-    ):
+    ) -> None:
         super().__init__()
+        device = get_device(device)
+        if isinstance(net_arch, dict):
+            net_arch = [net_arch]
+        shared_net: List[nn.Module] = []
         policy_net: List[nn.Module] = []
         value_net: List[nn.Module] = []
-        last_layer_dim_shared = features_dim
+        policy_only_layers: List[int] = []  # Layer sizes of the network that only belongs to the policy network
+        value_only_layers: List[int] = []  # Layer sizes of the network that only belongs to the value network
 
-        if isinstance(net_arch, dict):
-            shared_net = net_arch.get("shared_layers", [])
-            pi_net = net_arch.get("pi", [])
-            vf_net = net_arch.get("vf", [])
-        else:
-            shared_net = net_arch
-            pi_net = []
-            vf_net = []
-
-        for layer_dim in shared_net:
-            policy_net.append(KANLayer(last_layer_dim_shared, layer_dim))
-            value_net.append(KANLayer(last_layer_dim_shared, layer_dim))
-            last_layer_dim_shared = layer_dim
+        # Iterate through the shared layers and build the shared parts of the network
+        last_layer_dim_shared = feature_dim
+        for layer in net_arch:
+            if isinstance(layer, int):  # the shared layers
+                shared_net.append(KANLayer(last_layer_dim_shared, layer))
+                last_layer_dim_shared = layer
+            else:
+                assert isinstance(layer, dict), "Error: the net_arch list can only contain ints and dicts"
+                if "pi" in layer:
+                    assert isinstance(layer["pi"], list), "Error: net_arch[-1]['pi'] must be List[int]"
+                    policy_only_layers = layer["pi"]
+                if "vf" in layer:
+                    assert isinstance(layer["vf"], list), "Error: net_arch[-1]['vf'] must be List[int]"
+                    value_only_layers = layer["vf"]
+                break  # Stop after the dict with separate layers
 
         last_layer_dim_pi = last_layer_dim_shared
-        for layer_dim in pi_net:
-            policy_net.append(KANLayer(last_layer_dim_pi, layer_dim))
-            last_layer_dim_pi = layer_dim
-
         last_layer_dim_vf = last_layer_dim_shared
-        for layer_dim in vf_net:
-            value_net.append(KANLayer(last_layer_dim_vf, layer_dim))
-            last_layer_dim_vf = layer_dim
 
-        self.policy_net = nn.Sequential(*policy_net)
-        self.value_net = nn.Sequential(*value_net)
+        # Build the non-shared part of the network
+        from itertools import zip_longest
+        for pi_layer_size, vf_layer_size in zip_longest(policy_only_layers, value_only_layers):
+            if pi_layer_size is not None:
+                policy_net.append(KANLayer(last_layer_dim_pi, pi_layer_size))
+                last_layer_dim_pi = pi_layer_size
+            if vf_layer_size is not None:
+                value_net.append(KANLayer(last_layer_dim_vf, vf_layer_size))
+                last_layer_dim_vf = vf_layer_size
+
+        # Save dim, used to create the distributions
         self.latent_dim_pi = last_layer_dim_pi
         self.latent_dim_vf = last_layer_dim_vf
 
+        # Create networks
+        self.shared_net = nn.Sequential(*shared_net).to(device)
+        self.policy_net = nn.Sequential(*policy_net).to(device)
+        self.value_net = nn.Sequential(*value_net).to(device)
+
+    def forward(self, features: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        :return: latent_policy, latent_value of the specified network.
+            If all layers are shared, then ``latent_policy == latent_value``
+        """
+        shared_latent = self.shared_net(features)
+        return self.policy_net(shared_latent), self.value_net(shared_latent)
+    # Add the following methods to the KANMlpExtractor class in stable_baselines/a2c_pinn/policies_pinn.py after the forward method
     def forward_actor(self, features: th.Tensor) -> th.Tensor:
-        return self.policy_net(features)
+        shared_latent = self.shared_net(features)
+        return self.policy_net(shared_latent)
 
     def forward_critic(self, features: th.Tensor) -> th.Tensor:
-        return self.value_net(features)
-
+        shared_latent = self.shared_net(features)
+        return self.value_net(shared_latent)
+    
 class KANActorCriticPolicy(ActorCriticPolicy):
     """
     Actor-critic policy using enhanced KAN for the MLP extractor.
