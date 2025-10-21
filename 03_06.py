@@ -9,6 +9,7 @@ import numpy as np
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -116,7 +117,6 @@ def _bbands(close: pd.Series, n: int = 20, k: float = 2.0):
     lower = ma - k * sd
     return ma, upper, lower
 
-
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat([(high - low),
@@ -150,6 +150,7 @@ def _roll_z(s: pd.Series, n: int = 60) -> pd.Series:
     m = s.rolling(n, min_periods=n).mean()
     sd = s.rolling(n, min_periods=n).std(ddof=0)
     return ((s - m) / sd.replace(0, np.nan)).fillna(0.0).clip(-5, 5)
+
 def _willr(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
     hh = high.rolling(n, min_periods=n).max()
     ll = low.rolling(n, min_periods=n).min()
@@ -215,6 +216,7 @@ def engineer_features(df: pd.DataFrame, assets: list[str]) -> tuple[pd.DataFrame
     out = out.iloc[60:].copy()  # drop early rows with heavy rolling NaNs
 
     return out, FEATURES
+
 # ----------------------------------------------------------------------------
 #                            RL ENVIRONMENT (features-ready)
 # ----------------------------------------------------------------------------
@@ -290,7 +292,6 @@ class MultiAssetPortfolioEnv(gym.Env):
         truncated = False
         return self._get_observation(), reward, terminated, truncated, {}
 
-
 # ----------------------------------------------------------------------------
 #                        SIMULATION & METRICS (unchanged)
 # ----------------------------------------------------------------------------
@@ -316,7 +317,6 @@ def _simplex_project(w: np.ndarray) -> np.ndarray:
     w[w < 0] = 0.0
     s = w.sum()
     return (w / s) if s > 0 else np.ones_like(w) / w.size
-
 
 def simulate_pg_agent(agent_cls, price_data: np.ndarray, **kwargs):
     n_steps, n_assets = price_data.shape
@@ -476,7 +476,7 @@ def run_portfolio_analysis(portfolio_spec: dict):
             num_milestones = 10  # Episodes 10,20,...,100
             steps_per_milestone = total_steps // num_milestones
             wealth_curves = {}
-            avg_weights_dict = {}  # For bar plot (point 1)
+            avg_weights_dict = {}  # For heatmap plot
             cumulative_returns = []
 
             for milestone in range(1, num_milestones + 1):
@@ -520,29 +520,32 @@ def run_portfolio_analysis(portfolio_spec: dict):
             plt.savefig(f"cum_ret_vs_episodes_{algo_name}_{name}.png")
             plt.close()
 
-            # New: Bar plot for average weights vs episodes (point 1, like Fig. 6)
-            fig, axs = plt.subplots(nrows=num_milestones, ncols=1, figsize=(12, 3 * num_milestones), sharex=True)
-            for i, (episode, avg_w) in enumerate(avg_weights_dict.items()):
-                ax = axs[i] if num_milestones > 1 else axs
-                bars = ax.barh(asset_labels, avg_w)
-                ax.set_title(f"Episode {episode}")
-                ax.set_xlim(0, 1)
-                ax.set_xlabel("Average Weight")  # Since barh, xlabel is for weights
-                if i == 0:
-                    ax.set_ylabel("Assets")
-
-                # Add text labels on bars
-                for bar in bars:
-                    width = bar.get_width()
-                    ax.text(width + 0.01, bar.get_y() + bar.get_height() / 2, f"{width:.2f}", va='center', ha='left')
-
+            # Heatmap for average weights vs episodes
+            episodes = sorted(avg_weights_dict.keys())
+            weights_matrix = np.array([avg_weights_dict[ep] for ep in episodes]).T  # Shape: (n_assets, n_episodes)
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(
+                weights_matrix,
+                xticklabels=[f"Ep {ep}" for ep in episodes],
+                yticklabels=asset_labels,
+                cmap="viridis",
+                annot=True,
+                fmt=".2f",
+                vmin=0.0,
+                vmax=1.0,
+                cbar_kws={"label": "Average Weight"}
+            )
+            plt.title(f"Average Portfolio Weights vs Training Episodes for {algo_name} - {name}")
+            plt.xlabel("Training Episodes")
+            plt.ylabel("Assets")
             plt.tight_layout()
-            plt.savefig(f"avg_weights_vs_episode_{algo_name}_{name}.png")
+            plt.savefig(f"avg_weights_heatmap_{algo_name}_{name}.png")
             plt.close()
 
-            # Save val wealth data per episode (part of point 3)
+            # Save val wealth data per episode as CSV
             for episode, wealth in wealth_curves.items():
-                np.save(f"{algo_name}_val_wealth_episode{episode}_{name}.npy", np.array(wealth))
+                wealth_df = pd.DataFrame({"Wealth": wealth})
+                wealth_df.to_csv(f"{algo_name}_val_wealth_episode{episode}_{name}.csv", index_label="Step")
 
         else:  # Standard full training for others
             model.learn(total_timesteps=TRAIN_STEPS_MAP[algo_name])
@@ -560,10 +563,10 @@ def run_portfolio_analysis(portfolio_spec: dict):
     test_close = np.vstack([test_df[f"close_{a}"].values for a in assets]).T
     pg_agents = {
         "UBAH": (UBAH, {}),
-        "CRP": (CRP, {}), "OLMAR": (OLMAR, {"window": 5, "eps": 10})
-            , "RMR": (RMR, {"eps": 10}),
-         "PAMR": (PAMR, {"eps": 10, "C": 0.5})}
-        # ,"BEST": (BEST, {"price_history": test_close})
+        "CRP": (CRP, {}), "OLMAR": (OLMAR, {"window": 5, "eps": 10}),
+        "RMR": (RMR, {"eps": 10}),
+        "PAMR": (PAMR, {"eps": 10, "C": 0.5})
+    }
     for label, (cls, params) in pg_agents.items():
         print(f"Simulating {label} on {name}…")
         if label == "BEST":
@@ -612,9 +615,6 @@ def run_portfolio_analysis(portfolio_spec: dict):
     with open(f"metrics_comparison_{name}.txt", "w") as f:
         f.write(metrics_df.to_string())
     
-    
-    
-    
 if __name__ == "__main__":
     # Define the three portfolios with their specific assets and date ranges
     PORTFOLIOS = [
@@ -624,12 +624,6 @@ if __name__ == "__main__":
             'train_start': '2015-01-01', 'train_end': '2023-01-01',
             'test_start': '2023-01-02', 'test_end': '2025-01-01'
         },
-        # {
-        #     'name': 'FTSE 100 (U.K.)',
-        #     'assets': ['AAL.L', 'BATS.L', 'GLEN.L', 'BT-A.L', 'DGE.L', 'GSK.L', 'HSBA.L', 'RIO.L',  'LLOY.L', 'NG.L'],
-        #     'train_start': '2015-01-01', 'train_end': '2023-01-01',
-        #     'test_start': '2023-01-02', 'test_end': '2025-01-01'
-        # },
         {
             'name': 'VN100 (Vietnam)',
             'assets': ["HPG.VN", "VIX.VN", "MWG.VN", "DIG.VN", "MSN.VN", "STB.VN", "VSC.VN", "HSG.VN", "FPT.VN", "EIB.VN"],

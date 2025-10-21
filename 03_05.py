@@ -504,12 +504,12 @@ def run_portfolio_analysis(portfolio_spec: dict):
 if __name__ == "__main__":
     # Define the three portfolios with their specific assets and date ranges
     PORTFOLIOS = [
-        {
-            'name': 'S&P 100 (U.S.)',
-            'assets': ['MSFT', 'INTC', 'BAC', 'DIS', 'PFE', 'LLY', 'NKE', 'VZ', 'WMT', 'AMGN'],
-            'train_start': '2015-01-01', 'train_end': '2023-01-01',
-            'test_start': '2023-01-02', 'test_end': '2025-01-01'
-        },
+        # {
+        #     'name': 'S&P 100 (U.S.)',
+        #     'assets': ['MSFT', 'INTC', 'BAC', 'DIS', 'PFE', 'LLY', 'NKE', 'VZ', 'WMT', 'AMGN'],
+        #     'train_start': '2015-01-01', 'train_end': '2023-01-01',
+        #     'test_start': '2023-01-02', 'test_end': '2025-01-01'
+        # },
         # {
         #     'name': 'FTSE 100 (U.K.)',
         #     'assets': ['AAL.L', 'BATS.L', 'GLEN.L', 'BT-A.L', 'DGE.L', 'GSK.L', 'HSBA.L', 'RIO.L',  'LLOY.L', 'NG.L'],
@@ -518,16 +518,16 @@ if __name__ == "__main__":
         # },
         {
             'name': 'VN100 (Vietnam)',
-            'assets': ["HPG.VN", "VIX.VN", "SSI.VN", "DIG.VN", "MSN.VN", "STB.VN", "VNM.VN", "HSG.VN", "FPT.VN", "DPM.VN"],
-            'train_start': '2015-01-01', 'train_end': '2023-01-01',
-            'test_start': '2023-01-02', 'test_end': '2025-01-01'
-        },
-        {
-            'name': 'CSI 300 (China)',
-            'assets': ['601868.SS', '600010.SS', '601669.SS', '300059.SZ', '601398.SS', '600111.SS', '603993.SS', '600050.SS', '600515.SS', '600875.SS'],
+            'assets': ["HPG.VN", "VIX.VN", "MWG.VN", "DIG.VN", "MSN.VN", "STB.VN", "VSC.VN", "HSG.VN", "FPT.VN", "EIB.VN"],
             'train_start': '2015-01-01', 'train_end': '2023-01-01',
             'test_start': '2023-01-02', 'test_end': '2025-01-01'
         }
+        # {
+        #     'name': 'CSI 300 (China)',
+        #     'assets': ['601868.SS', '600010.SS', '601669.SS', '300059.SZ', '601398.SS', '600111.SS', '603993.SS', '600050.SS', '600515.SS', '600875.SS'],
+        #     'train_start': '2015-01-01', 'train_end': '2023-01-01',
+        #     'test_start': '2023-01-02', 'test_end': '2025-01-01'
+        # }
     ]
 
     # Loop through each portfolio and run the full analysis
