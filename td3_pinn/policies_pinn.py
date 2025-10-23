@@ -1,18 +1,11 @@
-from typing import Any, Optional, Union
-import torch as th
+# This file is here just to define MlpPolicy/CnnPolicy
+# that work for PPO
+from stable_baselines3.common.torch_layers import MlpExtractor
+from stable_baselines3.common.policies import ActorCriticPolicy, ActorCriticCnnPolicy, MultiInputActorCriticPolicy
+from stable_baselines3.common.utils import get_device
 import torch.nn as nn
-from gymnasium import spaces
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
-from stable_baselines3.common.preprocessing import get_action_dim
-from stable_baselines3.common.torch_layers import (
-    BaseFeaturesExtractor,
-    CombinedExtractor,
-    FlattenExtractor,
-    NatureCNN,
-    create_mlp,
-    get_actor_critic_arch,
-)
-from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
+import torch as th
+from typing import Union
 
 class KANLayer(nn.Module):
     """
@@ -53,331 +46,62 @@ class KANLayer(nn.Module):
         basis = self.b_spline_basis(x, grid, self.spline_order)
         activations = th.einsum('bfd,ofd->bo', basis, self.coefficients)
         return activations
-    
-    
-class Actor(BasePolicy):
+
+class KANMlpExtractor(MlpExtractor):
+    """
+    Custom MlpExtractor using KAN layers instead of standard MLP.
+    """
     def __init__(
         self,
-        observation_space: spaces.Space,
-        action_space: spaces.Box,
-        net_arch: list[int],
-        features_extractor: nn.Module,
-        features_dim: int,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        normalize_images: bool = True,
+        feature_dim: int,
+        net_arch: Union[list[int], dict[str, list[int]]],
+        activation_fn: type[nn.Module],  # Unused for KAN
+        device: Union[th.device, str] = "auto",
     ):
-        super().__init__(
-            observation_space,
-            action_space,
-            features_extractor=features_extractor,
-            normalize_images=normalize_images,
-            squash_output=True,
-        )
-        self.net_arch = net_arch
-        self.features_dim = features_dim
-        self.activation_fn = activation_fn
-        action_dim = get_action_dim(self.action_space)
-        actor_net = create_mlp(features_dim, action_dim, net_arch, activation_fn, squash_output=True)
-        self.mu = nn.Sequential(*actor_net)
+        super().__init__(feature_dim, net_arch, activation_fn, device)
+        self.device = get_device(device)  # Explicitly set device
 
-    def _get_constructor_parameters(self) -> dict[str, Any]:
-        data = super()._get_constructor_parameters()
-        data.update(
-            dict(
-                net_arch=self.net_arch,
-                features_dim=self.features_dim,
-                activation_fn=self.activation_fn,
-                features_extractor=self.features_extractor,
-            )
-        )
-        return data
+        # Define function to build KAN sequential
+        def create_kan_net(input_dim: int, arch: list[int]) -> nn.Sequential:
+            layers = []
+            current_dim = input_dim
+            for dim in arch:
+                layers.append(KANLayer(current_dim, dim))
+                current_dim = dim
+            return nn.Sequential(*layers)
 
-    def forward(self, obs: th.Tensor) -> th.Tensor:
-        features = self.extract_features(obs, self.features_extractor)
-        return self.mu(features)
+        shared_net: nn.Sequential = nn.Sequential()
+        policy_net: nn.Sequential = nn.Sequential()
+        value_net: nn.Sequential = nn.Sequential()
 
-    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
-        return self(observation)
-
-class KANActor(Actor):
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Box,
-        net_arch: list[int],
-        features_extractor: nn.Module,
-        features_dim: int,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        normalize_images: bool = True,
-        squash_output: bool = True,
-    ):
-        super().__init__(
-            observation_space,
-            action_space,
-            net_arch=net_arch,
-            features_extractor=features_extractor,
-            features_dim=features_dim,
-            activation_fn=activation_fn,
-            normalize_images=normalize_images,
-            # Do NOT pass squash_output here, as the parent hardcodes it
-        )
-        action_dim = get_action_dim(self.action_space)
-        kan_layers = []
-        prev_dim = features_dim
-        for hidden_dim in net_arch:
-            kan_layers.append(KANLayer(prev_dim, hidden_dim))
-            prev_dim = hidden_dim
-        kan_layers.append(KANLayer(prev_dim, action_dim))
-        if squash_output:
-            kan_layers.append(nn.Tanh())
-        self.mu = nn.Sequential(*kan_layers)
-
-    def _get_constructor_parameters(self) -> dict[str, Any]:
-        data = super()._get_constructor_parameters()
-        data.update(
-            dict(
-                grid_size=self.mu[0].grid_size if self.mu else 5,
-                spline_order=self.mu[0].spline_order if self.mu else 3,
-            )
-        )
-        return data
-    
-class KANContinuousCritic(ContinuousCritic):
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Box,
-        net_arch: list[int],
-        features_extractor: BaseFeaturesExtractor,
-        features_dim: int,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        normalize_images: bool = True,
-        n_critics: int = 2,
-        share_features_extractor: bool = False,
-    ):
-        super().__init__(
-            observation_space,
-            action_space,
-            net_arch=net_arch,
-            features_extractor=features_extractor,
-            features_dim=features_dim,
-            activation_fn=activation_fn,
-            normalize_images=normalize_images,
-            n_critics=n_critics,
-            share_features_extractor=share_features_extractor,
-        )
-        action_dim = get_action_dim(self.action_space)
-        self.q_networks = []
-        for idx in range(n_critics):
-            q_layers = []
-            prev_dim = features_dim + action_dim
-            for hidden_dim in net_arch:
-                q_layers.append(KANLayer(prev_dim, hidden_dim))
-                prev_dim = hidden_dim
-            q_layers.append(KANLayer(prev_dim, 1))
-            q_net = nn.Sequential(*q_layers)
-            self.add_module(f"qf{idx}", q_net)
-            self.q_networks.append(q_net)
-
-    def _get_constructor_parameters(self) -> dict[str, Any]:
-        data = super()._get_constructor_parameters()
-        data.update(
-            dict(
-                grid_size=self.q_networks[0][0].grid_size if self.q_networks else 5,
-                spline_order=self.q_networks[0][0].spline_order if self.q_networks else 3,
-            )
-        )
-        return data
-
-class TD3Policy(BasePolicy):
-    actor: Actor
-    actor_target: Actor
-    critic: ContinuousCritic
-    critic_target: ContinuousCritic
-
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Box,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        features_extractor_class: type[BaseFeaturesExtractor] = FlattenExtractor,
-        features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[dict[str, Any]] = None,
-        n_critics: int = 2,
-        share_features_extractor: bool = False,
-    ):
-        super().__init__(
-            observation_space,
-            action_space,
-            features_extractor_class,
-            features_extractor_kwargs,
-            optimizer_class=optimizer_class,
-            optimizer_kwargs=optimizer_kwargs,
-            squash_output=True,
-            normalize_images=normalize_images,
-        )
-        if net_arch is None:
-            if features_extractor_class == NatureCNN:
-                net_arch = [256, 256]
-            else:
-                net_arch = [400, 300]
-        actor_arch, critic_arch = get_actor_critic_arch(net_arch)
-        self.net_arch = net_arch
-        self.activation_fn = activation_fn
-        self.net_args = {
-            "observation_space": self.observation_space,
-            "action_space": self.action_space,
-            "net_arch": actor_arch,
-            "activation_fn": self.activation_fn,
-            "normalize_images": normalize_images,
-        }
-        self.actor_kwargs = self.net_args.copy()
-        self.critic_kwargs = self.net_args.copy()
-        self.critic_kwargs.update(
-            {
-                "n_critics": n_critics,
-                "net_arch": critic_arch,
-                "share_features_extractor": share_features_extractor,
-            }
-        )
-        self.share_features_extractor = share_features_extractor
-        self._build(lr_schedule)
-
-    def _build(self, lr_schedule: Schedule) -> None:
-        self.actor = self.make_actor(features_extractor=None)
-        self.actor_target = self.make_actor(features_extractor=None)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.actor.optimizer = self.optimizer_class(
-            self.actor.parameters(),
-            lr=lr_schedule(1),
-            **self.optimizer_kwargs,
-        )
-        if self.share_features_extractor:
-            self.critic = self.make_critic(features_extractor=self.actor.features_extractor)
-            self.critic_target = self.make_critic(features_extractor=self.actor_target.features_extractor)
+        if isinstance(net_arch, dict):
+            if "layers_common" in net_arch:
+                shared_net = create_kan_net(feature_dim, net_arch["layers_common"])
+            if "layers_policy" in net_arch:
+                policy_net = create_kan_net(shared_net[-1].out_features if len(shared_net) > 0 else feature_dim, net_arch["layers_policy"])
+            if "layers_value" in net_arch:
+                value_net = create_kan_net(shared_net[-1].out_features if len(shared_net) > 0 else feature_dim, net_arch["layers_value"])
+            self.latent_dim_pi = net_arch["layers_policy"][-1] if "layers_policy" in net_arch and net_arch["layers_policy"] else (shared_net[-1].out_features if len(shared_net) > 0 else feature_dim)
+            self.latent_dim_vf = net_arch["layers_value"][-1] if "layers_value" in net_arch and net_arch["layers_value"] else (shared_net[-1].out_features if len(shared_net) > 0 else feature_dim)
         else:
-            self.critic = self.make_critic(features_extractor=None)
-            self.critic_target = self.make_critic(features_extractor=None)
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic.optimizer = self.optimizer_class(
-            self.critic.parameters(),
-            lr=lr_schedule(1),
-            **self.optimizer_kwargs,
-        )
-        self.actor_target.set_training_mode(False)
-        self.critic_target.set_training_mode(False)
+            shared_net = create_kan_net(feature_dim, net_arch)
+            self.latent_dim_pi = net_arch[-1] if net_arch else feature_dim
+            self.latent_dim_vf = self.latent_dim_pi
 
-    def _get_constructor_parameters(self) -> dict[str, Any]:
-        data = super()._get_constructor_parameters()
-        data.update(
-            dict(
-                net_arch=self.net_arch,
-                activation_fn=self.net_args["activation_fn"],
-                n_critics=self.critic_kwargs["n_critics"],
-                lr_schedule=self._dummy_schedule,
-                optimizer_class=self.optimizer_class,
-                optimizer_kwargs=self.optimizer_kwargs,
-                features_extractor_class=self.features_extractor_class,
-                features_extractor_kwargs=self.features_extractor_kwargs,
-                share_features_extractor=self.share_features_extractor,
-            )
-        )
-        return data
+        self.shared_net = shared_net.to(self.device)
+        self.policy_net = policy_net.to(self.device)
+        self.value_net = value_net.to(self.device)
 
-    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> Actor:
-        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
-        return Actor(**actor_kwargs).to(self.device)
-
-    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ContinuousCritic:
-        critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
-        return ContinuousCritic(**critic_kwargs).to(self.device)
-
-    def forward(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
-        return self._predict(observation, deterministic=deterministic)
-
-    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
-        return self.actor(observation)
-
-    def set_training_mode(self, mode: bool) -> None:
-        self.actor.set_training_mode(mode)
-        self.critic.set_training_mode(mode)
-        self.training = mode
-
-class KANTD3Policy(TD3Policy):
-    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> KANActor:
-        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
-        return KANActor(**actor_kwargs).to(self.device)
-
-    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> KANContinuousCritic:
-        critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
-        return KANContinuousCritic(**critic_kwargs).to(self.device)
-
-class CnnPolicy(TD3Policy):
-    def __init__(
-        self,
-        observation_space: spaces.Space,
-        action_space: spaces.Box,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        features_extractor_class: type[BaseFeaturesExtractor] = NatureCNN,
-        features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[dict[str, Any]] = None,
-        n_critics: int = 2,
-        share_features_extractor: bool = False,
-    ):
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            net_arch,
-            activation_fn,
-            features_extractor_class,
-            features_extractor_kwargs,
-            normalize_images,
-            optimizer_class,
-            optimizer_kwargs,
-            n_critics,
-            share_features_extractor,
+class KANActorCriticPolicy(ActorCriticPolicy):
+    def _build_mlp_extractor(self) -> None:
+        self.mlp_extractor = KANMlpExtractor(
+            self.features_dim,
+            net_arch=self.net_arch,
+            activation_fn=self.activation_fn,
+            device=self.device,
         )
 
-class MultiInputPolicy(TD3Policy):
-    def __init__(
-        self,
-        observation_space: spaces.Dict,
-        action_space: spaces.Box,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-        activation_fn: type[nn.Module] = nn.ReLU,
-        features_extractor_class: type[BaseFeaturesExtractor] = CombinedExtractor,
-        features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[dict[str, Any]] = None,
-        n_critics: int = 2,
-        share_features_extractor: bool = False,
-    ):
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            net_arch,
-            activation_fn,
-            features_extractor_class,
-            features_extractor_kwargs,
-            normalize_images,
-            optimizer_class,
-            optimizer_kwargs,
-            n_critics,
-            share_features_extractor,
-        )
-
-MlpPolicy = KANTD3Policy
-CnnPolicy = KANTD3Policy
-MultiInputPolicy = KANTD3Policy
+# Update aliases
+MlpPolicy = KANActorCriticPolicy
+CnnPolicy = ActorCriticCnnPolicy  # Can subclass similarly if needed
+MultiInputPolicy = MultiInputActorCriticPolicy  # Can subclass if needed
